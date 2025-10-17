@@ -1,11 +1,10 @@
 from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse
-import subprocess
-import os
 import re
 import asyncio
 import logging
-from tempfile import TemporaryDirectory
+import httpx
+from typing import Optional
 
 app = FastAPI(
     title="First Commit Finder",
@@ -40,68 +39,145 @@ def parse_host_from_url(url: str) -> str:
     return m.group(1) if m else ""
 
 
-def run_git_commands(repo_url: str):
-    """
-    Clone repo and find first commit. Returns first commit hash and remote URL.
-    """
-    temp_dir = "/tmp" if os.path.exists("/tmp") else None
-    with TemporaryDirectory(prefix="repo_clone_", dir=temp_dir) as tmp:
-        repo_dir = os.path.join(tmp, "repo.git")
+async def get_first_commit_github(owner: str, repo: str) -> tuple[str, str]:
+    """Get first commit using GitHub API"""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # Get default branch
+        repo_url = f"https://api.github.com/repos/{owner}/{repo}"
+        resp = await client.get(repo_url)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=400, detail="Repository not found or not accessible")
+        
+        default_branch = resp.json().get("default_branch", "main")
+        
+        # Get commits in reverse order (oldest first)
+        commits_url = f"https://api.github.com/repos/{owner}/{repo}/commits"
+        params = {"sha": default_branch, "per_page": 1}
+        
+        # Try to get the last page (oldest commits)
+        resp = await client.get(commits_url, params=params)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=400, detail="Unable to fetch commits")
+        
+        # Get link header to find last page
+        link_header = resp.headers.get("Link", "")
+        last_page_match = re.search(r'page=(\d+)>; rel="last"', link_header)
+        
+        if last_page_match:
+            last_page = int(last_page_match.group(1))
+            params["page"] = last_page
+            resp = await client.get(commits_url, params=params)
+            commits = resp.json()
+            if commits:
+                first_commit = commits[-1]["sha"]
+            else:
+                raise HTTPException(status_code=400, detail="No commits found")
+        else:
+            # Single page of commits, get the last one
+            commits = resp.json()
+            if not commits:
+                raise HTTPException(status_code=400, detail="No commits found")
+            
+            # Need to get all commits on this page to find the first
+            params["per_page"] = 100
+            all_commits = []
+            page = 1
+            while True:
+                params["page"] = page
+                resp = await client.get(commits_url, params=params)
+                if resp.status_code != 200:
+                    break
+                batch = resp.json()
+                if not batch:
+                    break
+                all_commits.extend(batch)
+                if len(batch) < 100:
+                    break
+                page += 1
+                if page > 100:  # Safety limit
+                    break
+            
+            if all_commits:
+                first_commit = all_commits[-1]["sha"]
+            else:
+                raise HTTPException(status_code=400, detail="No commits found")
+        
+        https_url = f"https://github.com/{owner}/{repo}"
+        return first_commit, https_url
 
-        try:
-            logger.info("Cloning %s into %s", repo_url, repo_dir)
-            command = ["git", "clone", "--bare", "--filter=blob:none", "--no-checkout", repo_url, repo_dir]
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
 
-            for line in process.stdout:
-                logger.info('Command (%s)\n%s', ' '.join(command), line.strip())
+async def get_first_commit_gitlab(project_path: str) -> tuple[str, str]:
+    """Get first commit using GitLab API"""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # URL encode the project path
+        import urllib.parse
+        encoded_path = urllib.parse.quote(project_path, safe='')
+        
+        # Get commits in reverse order
+        commits_url = f"https://gitlab.com/api/v4/projects/{encoded_path}/repository/commits"
+        params = {"per_page": 100, "order": "default"}
+        
+        all_commits = []
+        page = 1
+        while True:
+            params["page"] = page
+            resp = await client.get(commits_url, params=params)
+            if resp.status_code != 200:
+                if page == 1:
+                    raise HTTPException(status_code=400, detail="Repository not found or not accessible")
+                break
+            
+            batch = resp.json()
+            if not batch:
+                break
+            all_commits.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+            if page > 100:  # Safety limit
+                break
+        
+        if not all_commits:
+            raise HTTPException(status_code=400, detail="No commits found")
+        
+        first_commit = all_commits[-1]["id"]
+        https_url = f"https://gitlab.com/{project_path}"
+        return first_commit, https_url
 
-            retcode = process.wait()
-            if retcode != 0:
-                raise subprocess.CalledProcessError(retcode, process.args)
 
-            logger.info("Getting first commit from %s", repo_dir)
-            res = subprocess.run(
-                ["git", "rev-list", "--max-parents=0", "--all"],
-                cwd=repo_dir,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=30,
-            )
-            logger.info("First commit found: %s", res)
-            out = res.stdout.decode().strip()
-            if not out:
-                raise HTTPException(status_code=400, detail="Could not determine first commit.")
-            first_commit = out.splitlines()[0].strip()
-
-            try:
-                res = subprocess.run(
-                    ["git", "remote", "get-url", "origin"],
-                    cwd=repo_dir,
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=10,
-                )
-                remote = res.stdout.decode().strip()
-            except subprocess.CalledProcessError:
-                remote = repo_url
-
-            return first_commit, remote
-
-        except subprocess.CalledProcessError as e:
-            out = (e.stdout or e.stderr or b"").decode(errors="ignore")
-            logger.warning("git error: %s", out)
-            raise HTTPException(status_code=400, detail=f"git error: {out}")
-        except subprocess.TimeoutExpired:
-            logger.warning("git operation timed out for %s", repo_url)
-            raise HTTPException(status_code=504, detail="git operation timed out")
+async def get_first_commit_bitbucket(workspace: str, repo: str) -> tuple[str, str]:
+    """Get first commit using Bitbucket API"""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # Get commits
+        commits_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo}/commits"
+        params = {"pagelen": 100}
+        
+        all_commits = []
+        next_url = commits_url
+        iterations = 0
+        
+        while next_url and iterations < 100:
+            resp = await client.get(next_url, params=params if iterations == 0 else None)
+            if resp.status_code != 200:
+                if iterations == 0:
+                    raise HTTPException(status_code=400, detail="Repository not found or not accessible")
+                break
+            
+            data = resp.json()
+            values = data.get("values", [])
+            if not values:
+                break
+            
+            all_commits.extend(values)
+            next_url = data.get("next")
+            iterations += 1
+        
+        if not all_commits:
+            raise HTTPException(status_code=400, detail="No commits found")
+        
+        first_commit = all_commits[-1]["hash"]
+        https_url = f"https://bitbucket.org/{workspace}/{repo}"
+        return first_commit, https_url
 
 
 @app.post("/first-commit", response_class=HTMLResponse)
@@ -109,34 +185,62 @@ async def first_commit(repo_url: str = Form(...)):
     if not repo_url:
         return HTMLResponse("<div class='error'>Please provide a repository URL.</div>", status_code=400)
 
-    host = parse_host_from_url(repo_url)
+    # Normalize URL
+    normalized = to_https_remote(repo_url)
+    host = parse_host_from_url(normalized)
+    
     if not host:
         return HTMLResponse("<div class='error'>Invalid repository URL.</div>", status_code=400)
     if host not in ALLOWED_HOSTS:
         return HTMLResponse(f"<div class='error'>Host not allowed: {host}</div>", status_code=403)
 
-    normalized = to_https_remote(repo_url)
-
-    loop = asyncio.get_event_loop()
     try:
-        first_commit, remote = await loop.run_in_executor(None, run_git_commands, repo_url)
+        # Parse repository info based on host
+        if host == "github.com":
+            # Extract owner/repo from URL
+            match = re.match(r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?$", normalized)
+            if not match:
+                raise HTTPException(status_code=400, detail="Invalid GitHub URL format")
+            owner, repo = match.groups()
+            first_commit_hash, remote_https = await get_first_commit_github(owner, repo)
+            
+        elif host == "gitlab.com":
+            # Extract project path from URL
+            match = re.match(r"https://gitlab\.com/(.+?)(?:\.git)?$", normalized)
+            if not match:
+                raise HTTPException(status_code=400, detail="Invalid GitLab URL format")
+            project_path = match.group(1)
+            first_commit_hash, remote_https = await get_first_commit_gitlab(project_path)
+            
+        elif host == "bitbucket.org":
+            # Extract workspace/repo from URL
+            match = re.match(r"https://bitbucket\.org/([^/]+)/([^/]+?)(?:\.git)?$", normalized)
+            if not match:
+                raise HTTPException(status_code=400, detail="Invalid Bitbucket URL format")
+            workspace, repo = match.groups()
+            first_commit_hash, remote_https = await get_first_commit_bitbucket(workspace, repo)
+        else:
+            raise HTTPException(status_code=403, detail=f"Unsupported host: {host}")
+
     except HTTPException as he:
         detail = he.detail if isinstance(he.detail, str) else str(he.detail)
         status = he.status_code
         return HTMLResponse(f"<div class='error'>{detail}</div>", status_code=status)
+    except httpx.TimeoutException:
+        logger.warning("API request timed out for %s", repo_url)
+        return HTMLResponse("<div class='error'>Request timed out. Please try again.</div>", status_code=504)
     except Exception as e:
         logger.exception("Unhandled error for %s", repo_url)
-        return HTMLResponse("<div class='error'>internal error</div>", status_code=500)
+        return HTMLResponse("<div class='error'>An internal error occurred. Please try again.</div>", status_code=500)
 
-    remote_https = to_https_remote(remote) or normalized
-    commit_url = f"{remote_https.rstrip('/')}/commit/{first_commit}"
+    commit_url = f"{remote_https.rstrip('/')}/commit/{first_commit_hash}"
 
     html = f"""
     <div class="result">
         <div class="success-icon">✓</div>
         <div class="result-content">
             <div class="result-label">First Commit Hash:</div>
-            <div class="commit-hash">{first_commit}</div>
+            <div class="commit-hash">{first_commit_hash}</div>
             <div class="result-label" style="margin-top: 1rem;">View on {host}:</div>
             <a href="{commit_url}" target="_blank" rel="noopener" class="commit-link">{commit_url}</a>
         </div>
