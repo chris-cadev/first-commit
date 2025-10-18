@@ -1,0 +1,50 @@
+[project]
+authors = [
+  {name = "Christian Camacho", email = "chris.ca.dev@gmail.com"},
+]
+dependencies = [
+  "annotated-types==0.7.0",
+  "anyio==4.11.0",
+  "appdirs==1.4.4",
+  "certifi==2025.10.5",
+  "click==8.3.0",
+  "colorama==0.4.6",
+  "fastapi==0.119.0",
+  "gunicorn==23.0.0",
+  "h11==0.16.0",
+  "httpcore==1.0.9",
+  "httptools==0.7.1",
+  "httpx==0.28.1",
+  "idna==3.11",
+  "packaging==25.0",
+  "pydantic==2.12.3",
+  "pydantic-core==2.41.4",
+  "python-dotenv==1.1.1",
+  "python-multipart==0.0.20",
+  "PyYAML==6.0.3",
+  "setuptools==80.9.0",
+  "six==1.17.0",
+  "sniffio==1.3.1",
+  "starlette==0.48.0",
+  "typing-inspection==0.4.2",
+  "typing-extensions==4.15.0",
+  "uvicorn==0.37.0",
+  "watchfiles==1.1.1",
+  "websockets==15.0.1",
+]
+description = "Default template for PDM package"
+license = {text = "MIT"}
+name = "first-commit"
+readme = "README.md"
+requires-python = "==3.13.*"
+version = "0.1.0"
+
+[tool.pdm]
+distribution = false
+
+[tool.pdm.scripts]
+dev = "uvicorn main:app --reload"
+
+[build-system]
+build-backend = "pdm.backend"
+requires = ["pdm-backend"]
