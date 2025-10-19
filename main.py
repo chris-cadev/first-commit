@@ -32,6 +32,8 @@ def to_https_remote(url: str) -> str:
             return f"https://{host}/{path}"
     if url.startswith("ssh://"):
         url = re.sub(r"^ssh://", "https://", url)
+    if not url.startswith("https://"):
+        url = "https://" + url
     return re.sub(r"\.git$", "", url)
 
 
