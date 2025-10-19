@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>First Commit Finder</title>
+  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.7/dist/htmx.min.js"></script>
+  <link rel="stylesheet" href="/static/main.css" />
+  <link rel="icon"
+    href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%2210 0 100 100%22><text y=%22.90em%22 font-size=%2290%22>🔍</text></svg>" />
+</head>
+
+<body>
+  <div class="card">
+    <h2>🔍 First Commit Finder</h2>
+    <p class="subtitle">
+      Discover the very first commit of any GitHub, GitLab, or Bitbucket
+    </p>
+
+    <form hx-post="/first-commit" hx-target="#result" hx-swap="innerHTML" hx-indicator="#loading-indicator"
+      hx-on::before-request="document.querySelector('button[type=submit]').disabled = true"
+      hx-on::after-request="document.querySelector('button[type=submit]').disabled = false">
+      <div class="form-group">
+        <label for="repo_url">Repository URL</label>
+        <input name="repo_url" id="repo_url" type="text" placeholder="https://github.com/user/repo.git" required
+          autocomplete="off" spellcheck="false" />
+      </div>
+
+      <div class="form-buttons">
+        <button type="submit">Find First Commit</button>
+        <button type="reset"
+          onclick="document.getElementById('result').innerHTML=''; document.getElementById('repo_url').focus();">
+          Clear
+        </button>
+      </div>
+    </form>
+
+    <div id="loading-indicator">
+      <span class="spinner"></span>
+      Cloning repository and analyzing commits...
+    </div>
+
+    <div id="result"></div>
+  </div>
+
+  <script src="/static/main.js"></script>
+</body>
+
+</html>
