@@ -207,17 +207,19 @@ def error_response(request: Request, status: int, detail: str):
 @app.post("/first-commit", response_class=HTMLResponse)
 async def first_commit(request: Request, repo_url: str = Form(...)):
     if not repo_url:
-        return HTMLResponse("<div class='error'>Please provide a repository URL.</div>", status_code=400)
+        return error_response(
+            status=400, request=request, detail="Please provide a repository URL.")
 
     normalized = to_https_remote(repo_url)
     host = parse_host_from_url(normalized)
-    print('normalized:', normalized)
-    print('host:', host)
+    logger.info("lookup for host=%s", host)
 
     if not host:
-        return HTMLResponse("<div class='error'>Invalid repository URL.</div>", status_code=400)
+        return error_response(
+            status=400, request=request, detail="Invalid repository URL.")
     if host not in ALLOWED_HOSTS:
-        return HTMLResponse(f"<div class='error'>Host not allowed: {host}</div>", status_code=403)
+        return error_response(
+            status=403, request=request, detail=f"Host not allowed: {host}")
 
     try:
         # Parse repository info based on host
