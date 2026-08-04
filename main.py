@@ -6,6 +6,7 @@ import logging
 import os
 import secrets
 import time
+from urllib.parse import urlsplit, urlunsplit
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import httpx
@@ -108,31 +109,38 @@ ALLOWED_HOSTS = {"github.com", "gitlab.com", "bitbucket.org"}
 
 
 def to_https_remote(url: str) -> str:
+    url = url.strip()
     if not url:
         return url
     if url.startswith("git@"):
-        m = re.match(r"git@([^:]+):(.+?)(?:\.git)?$", url)
-        if m:
-            host, path = m.group(1), m.group(2)
-            return f"https://{host}/{path}"
-    if url.startswith("ssh://"):
-        url = re.sub(r"^ssh://", "https://", url)
-    if not url.startswith("https://"):
-        url = "https://" + url
-    return re.sub(r"\.git$", "", url)
+        match = re.match(r"git@([^:]+):(.+?)(?:\.git)?$", url)
+        if match:
+            host, path = match.groups()
+            url = f"https://{host}/{path}"
+    parts = urlsplit(url)
+    if parts.scheme == "ssh":
+        host = parts.hostname.lower() if parts.hostname else ""
+        path = parts.path.rstrip("/")
+    else:
+        if parts.scheme not in ("http", "https"):
+            parts = urlsplit("https://" + url)
+        host = parts.hostname.lower() if parts.hostname else ""
+        path = parts.path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    return urlunsplit(("https", host, path, "", ""))
 
 
 def parse_host_from_url(url: str) -> str:
-    if url.startswith("git@"):
-        m = re.match(r"git@([^:]+):", url)
-        return m.group(1) if m else ""
-    m = re.match(r"https?://([^/]+)/", url)
-    return m.group(1) if m else ""
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        parts = urlsplit("https://" + url)
+    return parts.hostname.lower() if parts.hostname else ""
 
 
 async def get_first_commit_github(owner: str, repo: str) -> tuple[str, str]:
     """Get first commit using GitHub API"""
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
         # Get default branch
         repo_url = f"https://api.github.com/repos/{owner}/{repo}"
         resp = await client.get(repo_url)
@@ -201,7 +209,7 @@ async def get_first_commit_github(owner: str, repo: str) -> tuple[str, str]:
 
 async def get_first_commit_gitlab(project_path: str) -> tuple[str, str]:
     """Get first commit using GitLab API"""
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
         # URL encode the project path
         import urllib.parse
         encoded_path = urllib.parse.quote(project_path, safe='')
@@ -241,7 +249,7 @@ async def get_first_commit_gitlab(project_path: str) -> tuple[str, str]:
 
 async def get_first_commit_bitbucket(workspace: str, repo: str) -> tuple[str, str]:
     """Get first commit using Bitbucket API"""
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
         # Get commits
         commits_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo}/commits"
         params = {"pagelen": 100}
