@@ -211,6 +211,8 @@ async def first_commit(request: Request, repo_url: str = Form(...)):
 
     normalized = to_https_remote(repo_url)
     host = parse_host_from_url(normalized)
+    print('normalized:', normalized)
+    print('host:', host)
 
     if not host:
         return HTMLResponse("<div class='error'>Invalid repository URL.</div>", status_code=400)

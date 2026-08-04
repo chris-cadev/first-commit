@@ -1,0 +1,2 @@
+[tasks.dev]
+run = "pdm run dev"
