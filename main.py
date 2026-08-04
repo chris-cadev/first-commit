@@ -258,24 +258,22 @@ async def first_commit(request: Request, repo_url: str = Form(...)):
 
     except HTTPException as he:
         detail = he.detail if isinstance(he.detail, str) else str(he.detail)
-        status = he.status_code
         return error_response(
-            status=status,
+            status=he.status_code,
             request=request,
             detail=detail
         )
     except httpx.TimeoutException:
         logger.warning("API request timed out for %s", repo_url)
-
         return error_response(
-            status=status,
+            status=504,
             request=request,
             detail="Request timed out. Please try again."
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Unhandled error for %s", repo_url)
         return error_response(
-            status=status,
+            status=500,
             request=request,
             detail="An internal error occurred. Please try again."
         )
