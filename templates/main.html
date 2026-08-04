@@ -1,23 +1,14 @@
 <!DOCTYPE html>
 <html lang="en">
   <head>
-    <script
-      async
-      src="https://www.googletagmanager.com/gtag/js?id=G-3T0TEF1GJR"
-    ></script>
-    <script>
-      window.dataLayer = window.dataLayer || [];
-      function gtag() {
-        dataLayer.push(arguments);
-      }
-      gtag("js", new Date());
-
-      gtag("config", "G-3T0TEF1GJR");
-    </script>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>First Commit Finder</title>
-    <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.7/dist/htmx.min.js"></script>
+    <script
+      src="/static/htmx.min.js"
+      integrity="sha384-ZBXiYtYQ6hJ2Y0ZNoYuI+Nq5MqWBr+chMrS/RkXpNzQCApHEhOt2aY8EJgqwHLkJ"
+      crossorigin="anonymous"
+    ></script>
     <link rel="stylesheet" href="/static/main.css" />
     <link
       rel="icon"
@@ -33,12 +24,11 @@
       </p>
 
       <form
+        id="lookup-form"
         hx-post="/first-commit"
         hx-target="#result"
         hx-swap="innerHTML"
         hx-indicator="#loading-indicator"
-        hx-on::before-request="document.querySelector('button[type=submit]').disabled = true"
-        hx-on::after-request="document.querySelector('button[type=submit]').disabled = false"
       >
         <div class="form-group">
           <label for="repo_url">Repository URL</label>
@@ -54,22 +44,18 @@
         </div>
 
         <div class="form-buttons">
-          <button type="submit">Find First Commit</button>
-          <button
-            type="reset"
-            onclick="document.getElementById('result').innerHTML=''; document.getElementById('repo_url').focus();"
-          >
-            Clear
-          </button>
+          <button type="submit" id="submit-btn">Find First Commit</button>
+          <button type="reset" id="clear-btn">Clear</button>
         </div>
       </form>
 
-      <div id="loading-indicator">
-        <span class="spinner"></span>
-        Cloning repository and analyzing commits...
+      <div id="loading-indicator" role="status">
+        <span class="spinner" aria-hidden="true"></span>
+        Looking up the first commit on GitHub, GitLab, or Bitbucket...
+        <button type="button" id="cancel-btn">Cancel</button>
       </div>
 
-      <div id="result"></div>
+      <div id="result" role="status" aria-live="polite" tabindex="-1"></div>
     </div>
 
     <script src="/static/main.js"></script>
