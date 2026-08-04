@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+.pdm-python
+.pdm.toml
+__pycache__
+*.pyc
+.vscode
+.env
+.env.*
+.vercel
+Dockerfile
+compose.yml
+tests
