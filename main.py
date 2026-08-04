@@ -3,9 +3,13 @@ from fastapi.responses import FileResponse, HTMLResponse
 from markupsafe import Markup
 import re
 import logging
+import time
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import httpx
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 app = FastAPI(
     title="First Commit Finder",
@@ -16,6 +20,35 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 templates = Jinja2Templates(directory="templates")
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return templates.TemplateResponse(
+        status_code=429,
+        request=request,
+        name="error.html",
+        context={
+            "message": "Too many requests. Please wait a minute and try again."
+        },
+    )
+
+
+RESULT_CACHE: dict[str, tuple[float, tuple[int, str, dict]]] = {}
+CACHE_TTL_SECONDS = 3600
+
+
+def get_cached(key: str) -> tuple[int, str, dict] | None:
+    entry = RESULT_CACHE.get(key)
+    if entry is None:
+        return None
+    if time.monotonic() - entry[0] < CACHE_TTL_SECONDS:
+        return entry[1]
+    RESULT_CACHE.pop(key, None)
+    return None
 
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
@@ -234,6 +267,10 @@ async def resolve_first_commit(repo_url: str) -> tuple[int, str, dict]:
     if host not in ALLOWED_HOSTS:
         return 403, "error.html", {"message": f"Host not allowed: {host}"}
 
+    cached = get_cached(normalized)
+    if cached is not None:
+        return cached
+
     try:
         if host == "github.com":
             match = re.match(
@@ -271,11 +308,13 @@ async def resolve_first_commit(repo_url: str) -> tuple[int, str, dict]:
         return 500, "error.html", {"message": "An internal error occurred. Please try again."}
 
     commit_url = f"{remote_https.rstrip('/')}/commit/{first_commit_hash}"
-    return 200, "first-commit.html", {
+    result = 200, "first-commit.html", {
         "commit_hash": first_commit_hash,
         "commit_url": commit_url,
         "host": host,
     }
+    RESULT_CACHE[normalized] = (time.monotonic(), result)
+    return result
 
 
 def render_fragment(request: Request, template: str, context: dict) -> Markup:
@@ -283,6 +322,7 @@ def render_fragment(request: Request, template: str, context: dict) -> Markup:
 
 
 @app.post("/first-commit", response_class=HTMLResponse)
+@limiter.limit("20/minute")
 async def first_commit(request: Request, repo_url: str = Form(...)):
     status, template, context = await resolve_first_commit(repo_url)
     if request.headers.get("HX-Request") == "true":
@@ -299,6 +339,7 @@ async def first_commit(request: Request, repo_url: str = Form(...)):
 
 
 @app.get("/", response_class=HTMLResponse)
+@limiter.limit("60/minute")
 async def read_root(request: Request, url: str = None):
     if not url:
         return templates.TemplateResponse(
