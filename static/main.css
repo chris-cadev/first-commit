@@ -172,9 +172,60 @@ button[type="reset"]:hover {
     }
 }
 
+.examples {
+    margin-top: 1rem;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.examples-label {
+    color: #718096;
+    font-size: 0.85rem;
+}
+
+.example-link {
+    flex: none;
+    padding: 0.35rem 0.7rem;
+    font-size: 0.8rem;
+    font-family: 'Monaco', 'Courier New', monospace;
+    background: rgba(0, 212, 255, 0.08);
+    color: #00d4ff;
+    border: 1px solid rgba(0, 212, 255, 0.2);
+    border-radius: 999px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.example-link:hover {
+    background: rgba(0, 212, 255, 0.18);
+    border-color: rgba(0, 212, 255, 0.4);
+}
+
+#cancel-btn {
+    flex: none;
+    margin-left: 0.75rem;
+    padding: 0.3rem 0.8rem;
+    font-size: 0.8rem;
+    background: rgba(74, 85, 104, 0.5);
+    color: #e2e8f0;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+#cancel-btn:hover {
+    background: rgba(74, 85, 104, 0.7);
+}
+
 #result {
     margin-top: 1.5rem;
     animation: slideIn 0.4s ease;
+}
+
+#result:focus {
+    outline: none;
 }
 
 @keyframes slideIn {

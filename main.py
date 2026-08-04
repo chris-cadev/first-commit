@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
+from markupsafe import Markup
 import re
 import logging
 from fastapi.staticfiles import StaticFiles
@@ -219,109 +220,100 @@ async def get_first_commit_bitbucket(workspace: str, repo: str) -> tuple[str, st
         return first_commit, https_url
 
 
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    return FileResponse("static/favicon.ico")
-
-
-def error_response(request: Request, status: int, detail: str):
-    return templates.TemplateResponse(
-        status_code=status,
-        request=request,
-        name="error.html",
-        context={"message": detail}
-    )
-
-
-@app.post("/first-commit", response_class=HTMLResponse)
-async def first_commit(request: Request, repo_url: str = Form(...)):
+async def resolve_first_commit(repo_url: str) -> tuple[int, str, dict]:
+    """Resolve a repo URL to (status_code, template_name, context)."""
     if not repo_url:
-        return error_response(
-            status=400, request=request, detail="Please provide a repository URL.")
+        return 400, "error.html", {"message": "Please provide a repository URL."}
 
     normalized = to_https_remote(repo_url)
     host = parse_host_from_url(normalized)
     logger.info("lookup for host=%s", host)
 
     if not host:
-        return error_response(
-            status=400, request=request, detail="Invalid repository URL.")
+        return 400, "error.html", {"message": "Invalid repository URL."}
     if host not in ALLOWED_HOSTS:
-        return error_response(
-            status=403, request=request, detail=f"Host not allowed: {host}")
+        return 403, "error.html", {"message": f"Host not allowed: {host}"}
 
     try:
-        # Parse repository info based on host
         if host == "github.com":
-            # Extract owner/repo from URL
             match = re.match(
                 r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", normalized)
             if not match:
-                raise HTTPException(
-                    status_code=400, detail="Invalid GitHub URL format")
+                return 400, "error.html", {"message": "Invalid GitHub URL format"}
             owner, repo = match.groups()
             first_commit_hash, remote_https = await get_first_commit_github(owner, repo)
 
         elif host == "gitlab.com":
-            # Extract project path from URL
             match = re.match(
                 r"https://gitlab\.com/(.+?)(?:\.git)?/?$", normalized)
             if not match:
-                raise HTTPException(
-                    status_code=400, detail="Invalid GitLab URL format")
+                return 400, "error.html", {"message": "Invalid GitLab URL format"}
             project_path = match.group(1)
             first_commit_hash, remote_https = await get_first_commit_gitlab(project_path)
 
         elif host == "bitbucket.org":
-            # Extract workspace/repo from URL
             match = re.match(
                 r"https://bitbucket\.org/([^/]+)/([^/]+?)(?:\.git)?/?$", normalized)
             if not match:
-                raise HTTPException(
-                    status_code=400, detail="Invalid Bitbucket URL format")
+                return 400, "error.html", {"message": "Invalid Bitbucket URL format"}
             workspace, repo = match.groups()
             first_commit_hash, remote_https = await get_first_commit_bitbucket(workspace, repo)
         else:
-            raise HTTPException(
-                status_code=403, detail=f"Unsupported {host} host at the moment.")
-
+            return 403, "error.html", {"message": f"Unsupported {host} host at the moment."}
     except HTTPException as he:
         detail = he.detail if isinstance(he.detail, str) else str(he.detail)
-        return error_response(
-            status=he.status_code,
-            request=request,
-            detail=detail
-        )
+        return he.status_code, "error.html", {"message": detail}
     except httpx.TimeoutException:
         logger.warning("API request timed out for %s", repo_url)
-        return error_response(
-            status=504,
-            request=request,
-            detail="Request timed out. Please try again."
-        )
+        return 504, "error.html", {"message": "Request timed out. Please try again."}
     except Exception:
         logger.exception("Unhandled error for %s", repo_url)
-        return error_response(
-            status=500,
-            request=request,
-            detail="An internal error occurred. Please try again."
-        )
+        return 500, "error.html", {"message": "An internal error occurred. Please try again."}
 
     commit_url = f"{remote_https.rstrip('/')}/commit/{first_commit_hash}"
+    return 200, "first-commit.html", {
+        "commit_hash": first_commit_hash,
+        "commit_url": commit_url,
+        "host": host,
+    }
 
+
+def render_fragment(request: Request, template: str, context: dict) -> Markup:
+    return Markup(templates.get_template(template).render(**context, request=request))
+
+
+@app.post("/first-commit", response_class=HTMLResponse)
+async def first_commit(request: Request, repo_url: str = Form(...)):
+    status, template, context = await resolve_first_commit(repo_url)
+    if request.headers.get("HX-Request") == "true":
+        return templates.TemplateResponse(
+            request=request, name=template, context=context, status_code=status
+        )
+    fragment = render_fragment(request, template, context)
     return templates.TemplateResponse(
         request=request,
-        name="first-commit.html",
-        context={
-            "commit_hash": first_commit_hash,
-            "commit_url": commit_url,
-            "host": host,
-        }
+        name="main.html",
+        context={"fragment": fragment},
+        status_code=status,
     )
 
 
 @app.get("/", response_class=HTMLResponse)
-def read_root(request: Request):
+async def read_root(request: Request, url: str = None):
+    if not url:
+        return templates.TemplateResponse(
+            request=request, name="main.html", context={"fragment": ""}
+        )
+    status, template, context = await resolve_first_commit(url)
+    fragment = render_fragment(request, template, context)
     return templates.TemplateResponse(
-        request=request, name="main.html"
+        request=request,
+        name="main.html",
+        context={"fragment": fragment},
+        status_code=status,
     )
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return FileResponse("static/favicon.ico")

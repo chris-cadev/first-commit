@@ -3,6 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta
+      name="htmx-config"
+      content='{"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":false},{"code":"...","swap":true}]}'
+    />
     <title>First Commit Finder</title>
     <script
       src="/static/htmx.min.js"
@@ -25,6 +29,8 @@
 
       <form
         id="lookup-form"
+        method="post"
+        action="/first-commit"
         hx-post="/first-commit"
         hx-target="#result"
         hx-swap="innerHTML"
@@ -49,13 +55,20 @@
         </div>
       </form>
 
+      <div class="examples">
+        <span class="examples-label">Try:</span>
+        <button type="button" class="example-link" data-url="github.com/vercel/next.js">github.com/vercel/next.js</button>
+        <button type="button" class="example-link" data-url="gitlab.com/gitlab-org/gitlab">gitlab.com/gitlab-org/gitlab</button>
+        <button type="button" class="example-link" data-url="bitbucket.org/atlassian/python-bitbucket">bitbucket.org/atlassian/python-bitbucket</button>
+      </div>
+
       <div id="loading-indicator" role="status">
         <span class="spinner" aria-hidden="true"></span>
         Looking up the first commit on GitHub, GitLab, or Bitbucket...
         <button type="button" id="cancel-btn">Cancel</button>
       </div>
 
-      <div id="result" role="status" aria-live="polite" tabindex="-1"></div>
+      <div id="result" role="status" aria-live="polite" tabindex="-1">{% if fragment %}{{ fragment }}{% endif %}</div>
     </div>
 
     <script src="/static/main.js"></script>
