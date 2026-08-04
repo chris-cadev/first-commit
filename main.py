@@ -338,17 +338,18 @@ async def resolve_first_commit(repo_url: str) -> tuple[int, str, dict]:
         return 500, "error.html", {"message": "An internal error occurred. Please try again."}
 
     commit_url = f"{remote_https.rstrip('/')}/commit/{first_commit_hash}"
-    result = 200, "first-commit.html", {
+    context = {
         "commit_hash": first_commit_hash,
         "commit_url": commit_url,
         "host": host,
     }
+    result = 200, "first-commit.html", context
     RESULT_CACHE[normalized] = (time.monotonic(), result)
-    return result
+    return 200, "first-commit.html", dict(context)
 
 
 def render_fragment(request: Request, template: str, context: dict) -> Markup:
-    return Markup(templates.get_template(template).render(**context, request=request))
+    return Markup(templates.get_template(template).render({**context, "request": request}))
 
 
 @app.post("/first-commit", response_class=HTMLResponse)
