@@ -36,6 +36,7 @@
         hx-swap="innerHTML"
         hx-indicator="#loading-indicator"
       >
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
         <div class="form-group">
           <label for="repo_url">Repository URL</label>
           <input

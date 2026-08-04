@@ -3,6 +3,8 @@ from fastapi.responses import FileResponse, HTMLResponse
 from markupsafe import Markup
 import re
 import logging
+import os
+import secrets
 import time
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -39,6 +41,26 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 
 RESULT_CACHE: dict[str, tuple[float, tuple[int, str, dict]]] = {}
 CACHE_TTL_SECONDS = 3600
+
+CSRF_COOKIE = "csrf_token"
+
+
+def get_or_create_csrf_token(request: Request) -> str:
+    token = request.cookies.get(CSRF_COOKIE)
+    if not token:
+        token = secrets.token_urlsafe(32)
+    return token
+
+
+def set_csrf_cookie(response, token: str) -> None:
+    response.set_cookie(
+        CSRF_COOKIE,
+        token,
+        max_age=60 * 60,
+        httponly=True,
+        samesite="strict",
+        secure=os.environ.get("CSRF_COOKIE_SECURE") == "1",
+    )
 
 
 def get_cached(key: str) -> tuple[int, str, dict] | None:
@@ -323,36 +345,55 @@ def render_fragment(request: Request, template: str, context: dict) -> Markup:
 
 @app.post("/first-commit", response_class=HTMLResponse)
 @limiter.limit("20/minute")
-async def first_commit(request: Request, repo_url: str = Form(...)):
+async def first_commit(request: Request, repo_url: str = Form(...), csrf_token: str = Form("")):
+    submitted = csrf_token or request.headers.get("X-CSRF-Token", "")
+    cookie_token = request.cookies.get(CSRF_COOKIE)
+    if not cookie_token or not secrets.compare_digest(cookie_token, submitted):
+        return templates.TemplateResponse(
+            request=request,
+            name="error.html",
+            context={"message": "Session expired. Please reload the page and try again."},
+            status_code=403,
+        )
+
     status, template, context = await resolve_first_commit(repo_url)
     if request.headers.get("HX-Request") == "true":
         return templates.TemplateResponse(
             request=request, name=template, context=context, status_code=status
         )
+    token = get_or_create_csrf_token(request)
     fragment = render_fragment(request, template, context)
-    return templates.TemplateResponse(
+    response = templates.TemplateResponse(
         request=request,
         name="main.html",
-        context={"fragment": fragment},
+        context={"fragment": fragment, "csrf_token": token},
         status_code=status,
     )
+    set_csrf_cookie(response, token)
+    return response
 
 
 @app.get("/", response_class=HTMLResponse)
 @limiter.limit("60/minute")
 async def read_root(request: Request, url: str = None):
+    token = get_or_create_csrf_token(request)
     if not url:
-        return templates.TemplateResponse(
-            request=request, name="main.html", context={"fragment": ""}
+        response = templates.TemplateResponse(
+            request=request,
+            name="main.html",
+            context={"fragment": "", "csrf_token": token},
         )
-    status, template, context = await resolve_first_commit(url)
-    fragment = render_fragment(request, template, context)
-    return templates.TemplateResponse(
-        request=request,
-        name="main.html",
-        context={"fragment": fragment},
-        status_code=status,
-    )
+    else:
+        status, template, context = await resolve_first_commit(url)
+        fragment = render_fragment(request, template, context)
+        response = templates.TemplateResponse(
+            request=request,
+            name="main.html",
+            context={"fragment": fragment, "csrf_token": token},
+            status_code=status,
+        )
+    set_csrf_cookie(response, token)
+    return response
 
 
 @app.get("/favicon.ico", include_in_schema=False)
