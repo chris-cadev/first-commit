@@ -1,11 +1,15 @@
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from markupsafe import Markup
+import hashlib
+import json
 import re
 import logging
 import os
 import secrets
+import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit, urlunsplit
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -40,10 +44,224 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     )
 
 
-RESULT_CACHE: dict[str, tuple[float, tuple[int, str, dict]]] = {}
+CACHE_DB_PATH = os.environ.get("CACHE_DB_PATH", "first_commit_cache.db")
 CACHE_TTL_SECONDS = 3600
+AUDIT_RETENTION_DAYS = int(os.environ.get("AUDIT_RETENTION_DAYS", "90"))
+AUDIT_LOG_IP = os.environ.get("AUDIT_LOG_IP", "1") == "1"
+CACHE_ENABLED = True
 
 CSRF_COOKIE = "csrf_token"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS search_cache (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    stored_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_search_cache_stored_at ON search_cache(stored_at);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    client_ip TEXT,
+    repo_url TEXT NOT NULL,
+    host TEXT,
+    outcome TEXT NOT NULL,
+    cache_hit INTEGER NOT NULL DEFAULT 0,
+    commit_hash TEXT,
+    status_code INTEGER NOT NULL,
+    duration_ms INTEGER,
+    prev_hash TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
+
+CREATE TABLE IF NOT EXISTS cache_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    cache_key TEXT NOT NULL,
+    change_type TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cache_audit_ts ON cache_audit(ts);
+
+CREATE TRIGGER IF NOT EXISTS trg_search_cache_insert
+AFTER INSERT ON search_cache BEGIN
+    INSERT INTO cache_audit(ts, cache_key, change_type)
+    VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NEW.key, 'insert');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_search_cache_update
+AFTER UPDATE ON search_cache BEGIN
+    INSERT INTO cache_audit(ts, cache_key, change_type)
+    VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NEW.key, 'update');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_search_cache_delete
+AFTER DELETE ON search_cache BEGIN
+    INSERT INTO cache_audit(ts, cache_key, change_type)
+    VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), OLD.key, 'delete');
+END;
+"""
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _sanitize(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return _CONTROL_CHARS.sub("", value)
+
+
+def _db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(CACHE_DB_PATH, timeout=10, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA trusted_schema=OFF")
+    conn.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 100_000)
+    return conn
+
+
+def init_db() -> None:
+    global CACHE_ENABLED
+    try:
+        conn = _db_connect()
+        conn.executescript(SCHEMA)
+        os.chmod(CACHE_DB_PATH, 0o600)
+        rows = conn.execute("PRAGMA quick_check").fetchall()
+        if rows != [("ok",)]:
+            logger.warning("SQLite quick_check failed: %s", rows)
+            CACHE_ENABLED = False
+        purge_expired(conn)
+        conn.close()
+    except Exception:
+        logger.exception("Failed to initialize SQLite cache; running uncached")
+        CACHE_ENABLED = False
+
+
+def purge_expired(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "DELETE FROM search_cache WHERE stored_at <= ?",
+        (time.time() - CACHE_TTL_SECONDS,),
+    )
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=AUDIT_RETENTION_DAYS))
+    conn.execute(
+        "DELETE FROM audit_log WHERE ts < ?",
+        (cutoff.isoformat(timespec="milliseconds"),),
+    )
+    conn.execute(
+        "DELETE FROM cache_audit WHERE ts < ?",
+        (cutoff.isoformat(timespec="milliseconds").replace("+00:00", "Z"),),
+    )
+
+
+def get_cached(key: str) -> tuple[int, str, dict] | None:
+    if not CACHE_ENABLED:
+        return None
+    try:
+        conn = _db_connect()
+        row = conn.execute(
+            "SELECT value FROM search_cache WHERE key = ? AND stored_at > ?",
+            (key, time.time() - CACHE_TTL_SECONDS),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            return None
+        data = json.loads(row[0])
+        return data["status"], data["template"], data["context"]
+    except Exception:
+        logger.warning("cache read failed", exc_info=True)
+        return None
+
+
+def set_cached(key: str, result: tuple[int, str, dict]) -> None:
+    if not CACHE_ENABLED:
+        return
+    try:
+        conn = _db_connect()
+        conn.execute(
+            "INSERT OR REPLACE INTO search_cache(key, value, stored_at) VALUES (?, ?, ?)",
+            (
+                key,
+                json.dumps(
+                    {"status": result[0], "template": result[1], "context": result[2]}
+                ),
+                time.time(),
+            ),
+        )
+        conn.execute(
+            "DELETE FROM search_cache WHERE stored_at <= ?",
+            (time.time() - CACHE_TTL_SECONDS,),
+        )
+        conn.close()
+    except Exception:
+        logger.warning("cache write failed", exc_info=True)
+
+
+def _audit_prev_hash(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute(
+        "SELECT ts, client_ip, repo_url, host, outcome, cache_hit, commit_hash, "
+        "status_code, duration_ms, prev_hash FROM audit_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    parts = ["" if v is None else str(v) for v in row]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def record_audit(
+    *,
+    client_ip: str | None,
+    repo_url: str,
+    host: str | None,
+    outcome: str,
+    cache_hit: bool,
+    commit_hash: str | None,
+    status_code: int,
+    duration_ms: int,
+) -> None:
+    try:
+        conn = _db_connect()
+        prev_hash = _audit_prev_hash(conn)
+        conn.execute(
+            "INSERT INTO audit_log(ts, client_ip, repo_url, host, outcome, cache_hit, "
+            "commit_hash, status_code, duration_ms, prev_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                client_ip if AUDIT_LOG_IP else None,
+                _sanitize(repo_url),
+                _sanitize(host),
+                outcome,
+                int(cache_hit),
+                commit_hash,
+                status_code,
+                duration_ms,
+                prev_hash,
+            ),
+        )
+        purge_expired(conn)
+        conn.close()
+    except Exception:
+        logger.warning("audit write failed", exc_info=True)
+
+
+def audit_outcome(status_code: int, template: str, context: dict) -> str:
+    if status_code == 200:
+        return "success"
+    if status_code == 403:
+        return "host_not_allowed"
+    if status_code == 429:
+        return "rate_limited"
+    if status_code == 504:
+        return "timeout"
+    if status_code == 502:
+        return "upstream_error"
+    message = (context or {}).get("message", "")
+    if "not found" in message.lower():
+        return "not_found"
+    if "no commits" in message.lower():
+        return "no_commits"
+    if status_code >= 500:
+        return "internal_error"
+    return "error"
 
 
 def get_or_create_csrf_token(request: Request) -> str:
@@ -63,15 +281,6 @@ def set_csrf_cookie(response, token: str) -> None:
         secure=os.environ.get("CSRF_COOKIE_SECURE") == "1",
     )
 
-
-def get_cached(key: str) -> tuple[int, str, dict] | None:
-    entry = RESULT_CACHE.get(key)
-    if entry is None:
-        return None
-    if time.monotonic() - entry[0] < CACHE_TTL_SECONDS:
-        return entry[1]
-    RESULT_CACHE.pop(key, None)
-    return None
 
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
@@ -104,6 +313,8 @@ async def add_security_headers(request: Request, call_next):
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("first-commit")
+
+init_db()
 
 ALLOWED_HOSTS = {"github.com", "gitlab.com", "bitbucket.org"}
 
@@ -321,30 +532,30 @@ async def get_first_commit_bitbucket(workspace: str, repo: str) -> tuple[str, st
         return first_commit, https_url
 
 
-async def resolve_first_commit(repo_url: str) -> tuple[int, str, dict]:
-    """Resolve a repo URL to (status_code, template_name, context)."""
+async def _resolve_first_commit(repo_url: str) -> tuple[int, str, dict, bool, str]:
+    """Resolve a repo URL to (status_code, template_name, context, cache_hit, host)."""
     if not repo_url:
-        return 400, "error.html", {"message": "Please provide a repository URL."}
+        return 400, "error.html", {"message": "Please provide a repository URL."}, False, ""
 
     normalized = to_https_remote(repo_url)
     host = parse_host_from_url(normalized)
     logger.info("lookup for host=%s", host)
 
     if not host:
-        return 400, "error.html", {"message": "Invalid repository URL."}
+        return 400, "error.html", {"message": "Invalid repository URL."}, False, host
     if host not in ALLOWED_HOSTS:
-        return 403, "error.html", {"message": f"Host not allowed: {host}"}
+        return 403, "error.html", {"message": f"Host not allowed: {host}"}, False, host
 
     cached = get_cached(normalized)
     if cached is not None:
-        return cached
+        return cached[0], cached[1], cached[2], True, host
 
     try:
         if host == "github.com":
             match = re.match(
                 r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", normalized)
             if not match:
-                return 400, "error.html", {"message": "Invalid GitHub URL format"}
+                return 400, "error.html", {"message": "Invalid GitHub URL format"}, False, host
             owner, repo = match.groups()
             first_commit_hash, remote_https = await get_first_commit_github(owner, repo)
 
@@ -352,7 +563,7 @@ async def resolve_first_commit(repo_url: str) -> tuple[int, str, dict]:
             match = re.match(
                 r"https://gitlab\.com/(.+?)(?:\.git)?/?$", normalized)
             if not match:
-                return 400, "error.html", {"message": "Invalid GitLab URL format"}
+                return 400, "error.html", {"message": "Invalid GitLab URL format"}, False, host
             project_path = match.group(1)
             first_commit_hash, remote_https = await get_first_commit_gitlab(project_path)
 
@@ -360,20 +571,20 @@ async def resolve_first_commit(repo_url: str) -> tuple[int, str, dict]:
             match = re.match(
                 r"https://bitbucket\.org/([^/]+)/([^/]+?)(?:\.git)?/?$", normalized)
             if not match:
-                return 400, "error.html", {"message": "Invalid Bitbucket URL format"}
+                return 400, "error.html", {"message": "Invalid Bitbucket URL format"}, False, host
             workspace, repo = match.groups()
             first_commit_hash, remote_https = await get_first_commit_bitbucket(workspace, repo)
         else:
-            return 403, "error.html", {"message": f"Unsupported {host} host at the moment."}
+            return 403, "error.html", {"message": f"Unsupported {host} host at the moment."}, False, host
     except HTTPException as he:
         detail = he.detail if isinstance(he.detail, str) else str(he.detail)
-        return he.status_code, "error.html", {"message": detail}
+        return he.status_code, "error.html", {"message": detail}, False, host
     except httpx.TimeoutException:
         logger.warning("API request timed out for %s", repo_url)
-        return 504, "error.html", {"message": "Request timed out. Please try again."}
+        return 504, "error.html", {"message": "Request timed out. Please try again."}, False, host
     except Exception:
         logger.exception("Unhandled error for %s", repo_url)
-        return 500, "error.html", {"message": "An internal error occurred. Please try again."}
+        return 500, "error.html", {"message": "An internal error occurred. Please try again."}, False, host
 
     commit_url = f"{remote_https.rstrip('/')}/commit/{first_commit_hash}"
     context = {
@@ -382,8 +593,26 @@ async def resolve_first_commit(repo_url: str) -> tuple[int, str, dict]:
         "host": host,
     }
     result = 200, "first-commit.html", context
-    RESULT_CACHE[normalized] = (time.monotonic(), result)
-    return 200, "first-commit.html", dict(context)
+    set_cached(normalized, result)
+    return 200, "first-commit.html", dict(context), False, host
+
+
+async def resolve_first_commit(repo_url: str, request: Request | None = None) -> tuple[int, str, dict]:
+    """Resolve a repo URL to (status_code, template_name, context), recording an audit entry."""
+    start = time.perf_counter()
+    status, template, context, cache_hit, host = await _resolve_first_commit(repo_url)
+    client_ip = request.client.host if request and request.client else None
+    record_audit(
+        client_ip=client_ip,
+        repo_url=repo_url,
+        host=host or None,
+        outcome=audit_outcome(status, template, context),
+        cache_hit=cache_hit,
+        commit_hash=context.get("commit_hash") if status == 200 else None,
+        status_code=status,
+        duration_ms=int((time.perf_counter() - start) * 1000),
+    )
+    return status, template, context
 
 
 def render_fragment(request: Request, template: str, context: dict) -> Markup:
@@ -403,7 +632,7 @@ async def first_commit(request: Request, repo_url: str = Form(...), csrf_token: 
             status_code=403,
         )
 
-    status, template, context = await resolve_first_commit(repo_url)
+    status, template, context = await resolve_first_commit(repo_url, request=request)
     if request.headers.get("HX-Request") == "true":
         return templates.TemplateResponse(
             request=request, name=template, context=context, status_code=status
@@ -431,7 +660,7 @@ async def read_root(request: Request, url: str = None):
             context={"fragment": "", "csrf_token": token},
         )
     else:
-        status, template, context = await resolve_first_commit(url)
+        status, template, context = await resolve_first_commit(url, request=request)
         fragment = render_fragment(request, template, context)
         response = templates.TemplateResponse(
             request=request,

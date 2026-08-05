@@ -9,3 +9,6 @@ __pycache__/
 .vercel/
 dist/
 build/
+*.db
+*.db-wal
+*.db-shm
