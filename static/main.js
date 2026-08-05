@@ -15,6 +15,8 @@ const HOST_NAMES = {
   "bitbucket.org": "Bitbucket",
 };
 
+const DEFAULT_LOADING_MESSAGE = "Looking up the first commit on GitHub, GitLab, Bitbucket, or Bitbucket Server...";
+
 function hostForUrl(url) {
   const value = url.trim();
   if (!value) return "";
@@ -36,7 +38,7 @@ function updateLoadingMessage() {
   const name = HOST_NAMES[host];
   loadingMessage.textContent = name
     ? `Looking up the first commit on ${name}...`
-    : "Looking up the first commit on GitHub, GitLab, or Bitbucket...";
+    : DEFAULT_LOADING_MESSAGE;
 }
 
 form.addEventListener("htmx:beforeRequest", function () {
@@ -56,7 +58,7 @@ document.body.addEventListener("htmx:afterSwap", function (event) {
 
 clearBtn.addEventListener("click", function () {
   resultDiv.innerHTML = "";
-  loadingMessage.textContent = "Looking up the first commit on GitHub, GitLab, or Bitbucket...";
+  loadingMessage.textContent = DEFAULT_LOADING_MESSAGE;
   document.getElementById("repo_url").focus();
 });
 

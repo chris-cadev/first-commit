@@ -14,6 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import httpx
+from dotenv import load_dotenv
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -23,6 +24,8 @@ app = FastAPI(
     description="Provide a repo URL and get the first commit URL (HTMX UI)",
     version="1.0.0",
 )
+
+load_dotenv()
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -318,6 +321,38 @@ init_db()
 
 ALLOWED_HOSTS = {"github.com", "gitlab.com", "bitbucket.org"}
 
+BITBUCKET_SERVER_HOSTS = {
+    h.strip().lower()
+    for h in os.environ.get("BITBUCKET_SERVER_HOSTS", "").split(",")
+    if h.strip()
+}
+
+
+_BITBUCKET_SERVER_WEB_RE = re.compile(
+    r"^/projects/([^/]+)/repos/([^/]+?)(?:\.git)?(?:/.*)?$", re.IGNORECASE)
+_BITBUCKET_SERVER_SCM_RE = re.compile(
+    r"^/scm/([^/]+)/([^/]+?)(?:\.git)?/?$", re.IGNORECASE)
+
+
+def resolve_bitbucket_server(url: str) -> str | None:
+    """Resolve a Bitbucket Server web/SCM URL to its canonical git URI.
+
+    Returns "https://host/scm/PROJECT/repo.git" or None when the URL does
+    not look like a Bitbucket Server repository.
+    """
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        parts = urlsplit("https://" + url)
+    host = parts.hostname.lower() if parts.hostname else ""
+    if not host:
+        return None
+    path = parts.path.rstrip("/")
+    match = _BITBUCKET_SERVER_WEB_RE.match(path) or _BITBUCKET_SERVER_SCM_RE.match(path)
+    if not match:
+        return None
+    project, repo = match.groups()
+    return urlunsplit(("https", host, f"/scm/{project}/{repo}.git", "", ""))
+
 
 def to_https_remote(url: str) -> str:
     url = url.strip()
@@ -328,6 +363,9 @@ def to_https_remote(url: str) -> str:
         if match:
             host, path = match.groups()
             url = f"https://{host}/{path}"
+    resolved = resolve_bitbucket_server(url)
+    if resolved is not None:
+        return resolved
     parts = urlsplit(url)
     if parts.scheme == "ssh":
         host = parts.hostname.lower() if parts.hostname else ""
@@ -532,6 +570,62 @@ async def get_first_commit_bitbucket(workspace: str, repo: str) -> tuple[str, st
         return first_commit, https_url
 
 
+async def get_first_commit_bitbucket_server(host: str, project: str, repo: str) -> tuple[str, str]:
+    """Get first commit from a Bitbucket Server (Data Center) REST API."""
+    import asyncio
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
+        # Commits come back newest-first; the first commit lives on the last
+        # offset. Pages past the end return 200 + {"values": []}, so locate
+        # the last non-empty offset by binary search.
+        commits_url = (
+            f"https://{host}/rest/api/1.0/projects/{project}/repos/{repo}/commits"
+        )
+        page_size = 100
+
+        async def page_commits(start: int) -> list:
+            last_status = None
+            for attempt in range(3):
+                resp = await client.get(
+                    commits_url, params={"limit": page_size, "start": start})
+                last_status = resp.status_code
+                if resp.status_code == 200:
+                    await asyncio.sleep(0.5)
+                    return resp.json().get("values", [])
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    await asyncio.sleep(2 + attempt * 3)
+                    continue
+                break
+            if last_status in (429, 500, 502, 503, 504):
+                raise HTTPException(
+                    status_code=502, detail="Upstream API unavailable. Please try again.")
+            raise HTTPException(
+                status_code=400, detail="Repository not found or not accessible")
+
+        first_page = await page_commits(0)
+        if not first_page:
+            raise HTTPException(status_code=400, detail="No commits found")
+
+        # Exponential growth finds an empty offset, then binary search narrows
+        # down to the last non-empty one (the oldest commits).
+        lo, hi = 0, page_size
+        while await page_commits(hi):
+            lo, hi = hi, hi * 2
+        while lo + page_size < hi:
+            mid = ((lo + hi) // (2 * page_size)) * page_size
+            if await page_commits(mid):
+                lo = mid
+            else:
+                hi = mid
+
+        commits = await page_commits(lo)
+        if not commits:
+            raise HTTPException(status_code=400, detail="No commits found")
+
+        first_commit = commits[-1]["id"]
+        https_url = f"https://{host}/projects/{project}/repos/{repo}"
+        return first_commit, https_url
+
+
 async def _resolve_first_commit(repo_url: str) -> tuple[int, str, dict, bool, str]:
     """Resolve a repo URL to (status_code, template_name, context, cache_hit, host)."""
     if not repo_url:
@@ -543,7 +637,7 @@ async def _resolve_first_commit(repo_url: str) -> tuple[int, str, dict, bool, st
 
     if not host:
         return 400, "error.html", {"message": "Invalid repository URL."}, False, host
-    if host not in ALLOWED_HOSTS:
+    if host not in ALLOWED_HOSTS and host not in BITBUCKET_SERVER_HOSTS:
         return 403, "error.html", {"message": f"Host not allowed: {host}"}, False, host
 
     cached = get_cached(normalized)
@@ -574,6 +668,13 @@ async def _resolve_first_commit(repo_url: str) -> tuple[int, str, dict, bool, st
                 return 400, "error.html", {"message": "Invalid Bitbucket URL format"}, False, host
             workspace, repo = match.groups()
             first_commit_hash, remote_https = await get_first_commit_bitbucket(workspace, repo)
+        elif host in BITBUCKET_SERVER_HOSTS:
+            match = _BITBUCKET_SERVER_SCM_RE.match(urlsplit(normalized).path)
+            if not match:
+                return 400, "error.html", {"message": "Invalid Bitbucket Server URL format"}, False, host
+            project, repo = match.groups()
+            first_commit_hash, remote_https = await get_first_commit_bitbucket_server(
+                host, project, repo)
         else:
             return 403, "error.html", {"message": f"Unsupported {host} host at the moment."}, False, host
     except HTTPException as he:
@@ -586,7 +687,10 @@ async def _resolve_first_commit(repo_url: str) -> tuple[int, str, dict, bool, st
         logger.exception("Unhandled error for %s", repo_url)
         return 500, "error.html", {"message": "An internal error occurred. Please try again."}, False, host
 
-    commit_url = f"{remote_https.rstrip('/')}/commit/{first_commit_hash}"
+    if host in BITBUCKET_SERVER_HOSTS:
+        commit_url = f"{remote_https.rstrip('/')}/commits/{first_commit_hash}"
+    else:
+        commit_url = f"{remote_https.rstrip('/')}/commit/{first_commit_hash}"
     context = {
         "commit_hash": first_commit_hash,
         "commit_url": commit_url,
