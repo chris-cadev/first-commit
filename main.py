@@ -209,76 +209,114 @@ async def get_first_commit_github(owner: str, repo: str) -> tuple[str, str]:
 
 async def get_first_commit_gitlab(project_path: str) -> tuple[str, str]:
     """Get first commit using GitLab API"""
+    import asyncio
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
         # URL encode the project path
         import urllib.parse
         encoded_path = urllib.parse.quote(project_path, safe='')
 
-        # Get commits in reverse order
+        # Commits come back newest-first; the first commit lives on the last
+        # page, which GitLab never advertises (no rel="last" Link header), so
+        # locate it by binary search. Pages past the end return 200 + [].
         commits_url = f"https://gitlab.com/api/v4/projects/{encoded_path}/repository/commits"
-        params = {"per_page": 100, "order": "default"}
+        page_size = 100
 
-        all_commits = []
-        page = 1
-        while True:
-            params["page"] = page
-            resp = await client.get(commits_url, params=params)
-            if resp.status_code != 200:
-                if page == 1:
-                    raise HTTPException(
-                        status_code=400, detail="Repository not found or not accessible")
+        async def page_commits(page: int) -> list:
+            last_status = None
+            for attempt in range(3):
+                resp = await client.get(
+                    commits_url,
+                    params={"per_page": page_size, "page": page, "order": "default"},
+                )
+                last_status = resp.status_code
+                if resp.status_code == 200:
+                    await asyncio.sleep(0.5)
+                    return resp.json()
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    await asyncio.sleep(2 + attempt * 3)
+                    continue
                 break
+            if last_status in (429, 500, 502, 503, 504):
+                raise HTTPException(
+                    status_code=502, detail="Upstream API unavailable. Please try again.")
+            raise HTTPException(
+                status_code=400, detail="Repository not found or not accessible")
 
-            batch = resp.json()
-            if not batch:
-                break
-            all_commits.extend(batch)
-            if len(batch) < 100:
-                break
-            page += 1
-            if page > 100:  # Safety limit
-                break
-
-        if not all_commits:
+        first_page = await page_commits(1)
+        if not first_page:
             raise HTTPException(status_code=400, detail="No commits found")
 
-        first_commit = all_commits[-1]["id"]
+        # Exponential growth finds an empty page, then binary search narrows
+        # down to the last non-empty one (the oldest commits).
+        lo, hi = 1, 2
+        while await page_commits(hi):
+            lo, hi = hi, hi * 2
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if await page_commits(mid):
+                lo = mid
+            else:
+                hi = mid
+
+        commits = await page_commits(lo)
+        if not commits:
+            raise HTTPException(status_code=400, detail="No commits found")
+
+        first_commit = commits[-1]["id"]
         https_url = f"https://gitlab.com/{project_path}"
         return first_commit, https_url
 
 
 async def get_first_commit_bitbucket(workspace: str, repo: str) -> tuple[str, str]:
     """Get first commit using Bitbucket API"""
+    import asyncio
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
-        # Get commits
+        # Commits come back newest-first; the first commit lives on the last
+        # page. Pages past the end return 200 + {"values": []}, so locate the
+        # last non-empty page by binary search.
         commits_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo}/commits"
-        params = {"pagelen": 100}
+        page_size = 100
 
-        all_commits = []
-        next_url = commits_url
-        iterations = 0
-
-        while next_url and iterations < 100:
-            resp = await client.get(next_url, params=params if iterations == 0 else None)
-            if resp.status_code != 200:
-                if iterations == 0:
-                    raise HTTPException(
-                        status_code=400, detail="Repository not found or not accessible")
+        async def page_commits(page: int) -> list:
+            last_status = None
+            for attempt in range(3):
+                resp = await client.get(
+                    commits_url, params={"pagelen": page_size, "page": page})
+                last_status = resp.status_code
+                if resp.status_code == 200:
+                    await asyncio.sleep(0.5)
+                    return resp.json().get("values", [])
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                    await asyncio.sleep(2 + attempt * 3)
+                    continue
                 break
+            if last_status in (429, 500, 502, 503, 504):
+                raise HTTPException(
+                    status_code=502, detail="Upstream API unavailable. Please try again.")
+            raise HTTPException(
+                status_code=400, detail="Repository not found or not accessible")
 
-            data = resp.json()
-            values = data.get("values", [])
-            if not values:
-                break
-
-            all_commits.extend(values)
-            next_url = data.get("next")
-            iterations += 1
-
-        if not all_commits:
+        first_page = await page_commits(1)
+        if not first_page:
             raise HTTPException(status_code=400, detail="No commits found")
 
-        first_commit = all_commits[-1]["hash"]
+        # Exponential growth finds an empty page, then binary search narrows
+        # down to the last non-empty one (the oldest commits).
+        lo, hi = 1, 2
+        while await page_commits(hi):
+            lo, hi = hi, hi * 2
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if await page_commits(mid):
+                lo = mid
+            else:
+                hi = mid
+
+        commits = await page_commits(lo)
+        if not commits:
+            raise HTTPException(status_code=400, detail="No commits found")
+
+        first_commit = commits[-1]["hash"]
         https_url = f"https://bitbucket.org/{workspace}/{repo}"
         return first_commit, https_url
 
